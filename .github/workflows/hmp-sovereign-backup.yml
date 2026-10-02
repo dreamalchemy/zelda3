@@ -1,0 +1,45 @@
+name: HMP Sovereign Backup
+on:
+  push:
+    branches: [hmp-sovereign-backup-20261002]
+permissions:
+  contents: read
+jobs:
+  backup-and-restore-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Build and verify sovereign Git backup
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_BRANCH: hmp-sovereign-backup-20261002
+        run: |
+          set -euo pipefail
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          OUT="$RUNNER_TEMP/hmp-sovereign-backup"; MIRROR="$RUNNER_TEMP/${REPO_NAME}.mirror.git"; RESTORE="$RUNNER_TEMP/${REPO_NAME}-restore-test"
+          mkdir -p "$OUT"
+          AUTH="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c http.extraheader="AUTHORIZATION: basic $AUTH" clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" "$MIRROR"
+          git --git-dir="$MIRROR" fsck --full
+          DEFAULT_REF="$(git --git-dir="$MIRROR" symbolic-ref HEAD)"; DEFAULT_BRANCH="${DEFAULT_REF#refs/heads/}"; DEFAULT_SHA="$(git --git-dir="$MIRROR" rev-parse "$DEFAULT_REF")"
+          git --git-dir="$MIRROR" for-each-ref --format='%(refname)' | grep -v "^refs/heads/${BACKUP_BRANCH}$" > "$OUT/included-refs.txt"
+          REF_COUNT="$(wc -l < "$OUT/included-refs.txt" | tr -d ' ')"
+          BUNDLE="$OUT/${REPO_NAME}.bundle"
+          git --git-dir="$MIRROR" bundle create "$BUNDLE" --stdin < "$OUT/included-refs.txt"
+          git --git-dir="$MIRROR" bundle verify "$BUNDLE"
+          git bundle list-heads "$BUNDLE" > "$OUT/bundle-refs.txt"
+          git clone --branch "$DEFAULT_BRANCH" "$BUNDLE" "$RESTORE"
+          git -C "$RESTORE" fsck --full
+          RESTORED_SHA="$(git -C "$RESTORE" rev-parse HEAD)"; test "$RESTORED_SHA" = "$DEFAULT_SHA"
+          SHA256="$(sha256sum "$BUNDLE" | awk '{print $1}')"; SIZE_BYTES="$(stat -c%s "$BUNDLE")"
+          printf '{"schema":"hmp-sovereign-backup-manifest/v1","repository":"%s","created_at_utc":"%s","source_default_branch":"%s","source_default_sha":"%s","restored_default_sha":"%s","ref_count":%s,"bundle_file":"%s.bundle","bundle_size_bytes":%s,"bundle_sha256":"%s","integrity":"PASS","scope":"Git refs and reachable Git objects. LFS, GitHub metadata and local ephemeral state are separate layers."}\n' "$GITHUB_REPOSITORY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DEFAULT_BRANCH" "$DEFAULT_SHA" "$RESTORED_SHA" "$REF_COUNT" "$REPO_NAME" "$SIZE_BYTES" "$SHA256" > "$OUT/manifest.json"
+          sha256sum "$BUNDLE" > "$OUT/SHA256SUMS"
+          printf 'Repository: %s\nSource SHA: %s\nRestored SHA: %s\nResult: PASS\n' "$GITHUB_REPOSITORY" "$DEFAULT_SHA" "$RESTORED_SHA" > "$OUT/RESTORE-TEST.txt"
+      - name: Upload verified backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmp-sovereign-backup-${{ github.event.repository.name }}
+          path: ${{ runner.temp }}/hmp-sovereign-backup/
+          if-no-files-found: error
+          retention-days: 7
